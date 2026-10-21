@@ -244,6 +244,23 @@ class TestImportExport:
                     self.exportdir]
                 assert export(argv=argv) == 0
 
+            def incremental_export(self, options=()):
+                from devpi_server.importexport import export
+                argv = [
+                    "devpi-export",
+                    "--serverdir", str(self.mapp1.xom.config.server_path),
+                    *storage_args(self.mapp1.xom.config.server_path),
+                    "--incremental",
+                    *options,
+                    self.exportdir]
+                return export(argv=argv)
+
+            def increments_state(self):
+                path = self.exportdir.joinpath(
+                    "+increments", "index.json")
+                with path.open() as f:
+                    return json.load(f)
+
             def import_testdata(self, name, options=()):
                 from devpi_server.importexport import import_
 
@@ -386,6 +403,222 @@ class TestImportExport:
         mapp2.use(api2.stagename)
         assert mapp2.get_release_paths('pkg1') == [
             f'/user1/dev6/+f/{hashdir2}/pkg1-1.0.tar.gz']
+
+    def test_incremental_export_upload(self, impexp):
+        mapp1 = impexp.mapp1
+        api1 = mapp1.create_and_use()
+        impexp.export()
+        content = b'new-content'
+        mapp1.upload_file_pypi("hello-1.0.tar.gz", content, "hello", "1.0")
+        assert impexp.incremental_export() == 0
+        state = impexp.increments_state()
+        assert state["base_serial"] < state["last_serial"]
+        assert state["last_serial"] == mapp1.xom.keyfs.get_current_serial()
+        mapp2 = impexp.new_import()
+        mapp2.use(api1.stagename)
+        (path,) = mapp2.get_release_paths("hello")
+        r = mapp2.testapp.get(path)
+        assert r.status_code == 200
+        assert r.body == content
+
+    def test_incremental_export_doczip(self, impexp):
+        from devpi_server.keyfs_types import RelPath
+        mapp1 = impexp.mapp1
+        api1 = mapp1.create_and_use()
+        impexp.export()
+        mapp1.upload_file_pypi(
+            "hello-1.0.tar.gz", b"content", "hello", "1.0")
+        mapp1.upload_doc("hello.zip", b"zipcontent", "hello", "1.0")
+        assert impexp.incremental_export() == 0
+        files_root = impexp.exportdir.joinpath("+increments", "files")
+        relpaths = [
+            p.relative_to(files_root).as_posix()
+            for p in files_root.rglob("*") if p.is_file()]
+        # the release file and the doc zip were exported
+        assert len(relpaths) >= 2
+        mapp2 = impexp.new_import()
+        # every exported blob exists in the imported instance
+        with mapp2.xom.keyfs.read_transaction():
+            for relpath in relpaths:
+                keyname = (
+                    "STAGEFILE" if "/+f/" in relpath
+                    else "PYPIFILE_NOMD5")
+                key = mapp2.xom.keyfs.get_key_instance(
+                    keyname, RelPath(relpath))
+                entry = mapp2.xom.filestore.get_file_entry_from_key(key)
+                assert entry.file_exists(), relpath
+        mapp2.use(api1.stagename)
+        (path,) = mapp2.get_release_paths("hello")
+        assert mapp2.testapp.get(path).body == b"content"
+
+    def test_incremental_export_delete(self, impexp):
+        mapp1 = impexp.mapp1
+        api1 = mapp1.create_and_use()
+        mapp1.upload_file_pypi("hello-1.0.tar.gz", b"content", "hello", "1.0")
+        impexp.export()
+        mapp1.delete_project("hello")
+        assert impexp.incremental_export() == 0
+        mapp2 = impexp.new_import()
+        mapp2.use(api1.stagename)
+        mapp2.getjson(f"/{api1.stagename}/hello", code=404)
+
+    def test_incremental_export_indexconfig(self, impexp):
+        mapp1 = impexp.mapp1
+        api1 = mapp1.create_and_use()
+        impexp.export()
+        mapp1.set_custom_data({"answer": 42})
+        assert impexp.incremental_export() == 0
+        mapp2 = impexp.new_import()
+        indexlist = mapp2.getindexlist(api1.user)
+        assert indexlist[api1.stagename]["custom_data"] == {"answer": 42}
+
+    def test_incremental_export_chained(self, impexp):
+        mapp1 = impexp.mapp1
+        api1 = mapp1.create_and_use()
+        impexp.export()
+        content1 = b'content1'
+        mapp1.upload_file_pypi("hello-1.0.tar.gz", content1, "hello", "1.0")
+        assert impexp.incremental_export() == 0
+        state1 = impexp.increments_state()
+        content2 = b'content2'
+        mapp1.upload_file_pypi("hello-2.0.tar.gz", content2, "hello", "2.0")
+        assert impexp.incremental_export() == 0
+        state2 = impexp.increments_state()
+        assert state2["base_serial"] == state1["base_serial"]
+        assert state2["last_serial"] > state1["last_serial"]
+        assert len(state2["serials"]) == (
+            state2["last_serial"] - state2["base_serial"])
+        mapp2 = impexp.new_import()
+        mapp2.use(api1.stagename)
+        paths = mapp2.get_release_paths("hello")
+        bodies = sorted(mapp2.testapp.get(path).body for path in paths)
+        assert bodies == sorted([content1, content2])
+
+    def test_incremental_export_last_serial(self, impexp):
+        mapp1 = impexp.mapp1
+        api1 = mapp1.create_and_use()
+        impexp.export()
+        mapp1.upload_file_pypi("hello-1.0.tar.gz", b"hello", "hello", "1.0")
+        mid_serial = mapp1.xom.keyfs.get_current_serial()
+        mapp1.upload_file_pypi("pkg1-1.0.tar.gz", b"pkg1", "pkg1", "1.0")
+        assert impexp.incremental_export(
+            options=["--last-serial", str(mid_serial)]) == 0
+        state = impexp.increments_state()
+        assert state["last_serial"] == mid_serial
+        mapp2 = impexp.new_import()
+        mapp2.use(api1.stagename)
+        (path,) = mapp2.get_release_paths("hello")
+        assert mapp2.testapp.get(path).body == b"hello"
+        mapp2.getjson(f"/{api1.stagename}/pkg1", code=404)
+        # continue the interrupted export to the current serial
+        assert impexp.incremental_export() == 0
+        assert impexp.increments_state()["last_serial"] == (
+            mapp1.xom.keyfs.get_current_serial())
+        mapp3 = impexp.new_import()
+        mapp3.use(api1.stagename)
+        assert len(mapp3.get_release_paths("hello")) == 1
+        assert len(mapp3.get_release_paths("pkg1")) == 1
+
+    def test_incremental_export_resume(
+            self, impexp, terminalwriter, monkeypatch):
+        from devpi_server.importexport import IncrementalExporter
+        mapp1 = impexp.mapp1
+        api1 = mapp1.create_and_use()
+        impexp.export()
+        mapp1.upload_file_pypi("hello-1.0.tar.gz", b"hello", "hello", "1.0")
+        mapp1.upload_file_pypi("pkg1-1.0.tar.gz", b"pkg1", "pkg1", "1.0")
+        # crash after the changelog entry of one serial was written but
+        # before the marker recording it was updated
+        real_write_json = IncrementalExporter.write_json
+        crash_state = {"calls": 0}
+
+        def crash_write_json(self, path, data):
+            if path.name == "index.json" and data.get("last_serial"):
+                crash_state["calls"] += 1
+                if crash_state["calls"] == 2:
+                    # the first serial was marked complete, the second
+                    # one already has its changelog and files written
+                    raise Fatal("simulated interruption")
+            return real_write_json(self, path, data)
+
+        monkeypatch.setattr(
+            IncrementalExporter, "write_json", crash_write_json)
+        dumper = IncrementalExporter(terminalwriter, mapp1.xom)
+        with pytest.raises(Fatal, match="simulated interruption"):
+            dumper.dump(impexp.exportdir)
+        monkeypatch.undo()
+        state = impexp.increments_state()
+        crash_serial = state["last_serial"] + 1
+        # the changelog entry is there while the marker points one back
+        assert impexp.exportdir.joinpath(
+            "+increments", "changelog", str(crash_serial)).is_file()
+        # more changes happen before the export is continued
+        content2 = b"hello2"
+        mapp1.upload_file_pypi("hello-2.0.tar.gz", content2, "hello", "2.0")
+        current_serial = mapp1.xom.keyfs.get_current_serial()
+        assert impexp.incremental_export() == 0
+        state = impexp.increments_state()
+        assert state["last_serial"] == current_serial
+        assert state["serials"] == list(
+            range(state["base_serial"] + 1, current_serial + 1))
+        mapp2 = impexp.new_import()
+        mapp2.use(api1.stagename)
+        paths = mapp2.get_release_paths("hello")
+        assert len(paths) == 2
+        bodies = [mapp2.testapp.get(path).body for path in paths]
+        assert sorted(bodies) == sorted([b"hello", content2])
+
+    def test_incremental_export_without_full(self, impexp):
+        # an empty export directory can't be the base of an increment
+        assert impexp.incremental_export() == 1
+        # nor a directory without a recorded base serial
+        impexp.exportdir.mkdir(parents=True, exist_ok=True)
+        impexp.exportdir.joinpath("dataindex.json").write_text(
+            json.dumps({"dumpversion": Exporter.DUMPVERSION}))
+        assert impexp.incremental_export() == 1
+
+    def test_incremental_import_with_events(
+            self, impexp, makemapp, storage_args, tmpdir):
+        from devpi_server.importexport import import_
+        mapp1 = impexp.mapp1
+        api1 = mapp1.create_and_use()
+        impexp.export()
+        mapp1.upload_file_pypi("hello-1.0.tar.gz", b"hello", "hello", "1.0")
+        mapp1.delete_project("hello")
+        mapp1.upload_file_pypi("pkg1-1.0.tar.gz", b"pkg1", "pkg1", "1.0")
+        assert impexp.incremental_export() == 0
+        serverdir = tmpdir.join("import_events")
+        argv = [
+            "devpi-import",
+            "--serverdir", str(serverdir),
+            *storage_args(serverdir),
+            impexp.exportdir]
+        # without --no-events the notifier waits for all replayed serials
+        # and would fail on files which weren't materialized
+        assert import_(argv=argv) == 0
+        mapp2 = makemapp(options=["--serverdir", serverdir])
+        mapp2.use(api1.stagename)
+        mapp2.getjson(f"/{api1.stagename}/hello", code=404)
+        (path,) = mapp2.get_release_paths("pkg1")
+        assert mapp2.testapp.get(path).body == b"pkg1"
+
+    def test_incremental_export_bad_last_serial(self, impexp):
+        mapp1 = impexp.mapp1
+        mapp1.create_and_use()
+        impexp.export()
+        future_serial = mapp1.xom.keyfs.get_current_serial() + 100
+        assert impexp.incremental_export(
+            options=["--last-serial", str(future_serial)]) == 1
+
+    def test_incremental_import_skip(self, impexp):
+        mapp1 = impexp.mapp1
+        api1 = mapp1.create_and_use()
+        impexp.export()
+        mapp1.upload_file_pypi("hello-1.0.tar.gz", b"hello", "hello", "1.0")
+        assert impexp.incremental_export() == 0
+        mapp2 = impexp.new_import(options=("--no-increments",))
+        mapp2.use(api1.stagename)
+        mapp2.getjson(f"/{api1.stagename}/hello", code=404)
 
     def test_uuid(self, impexp):
         nodeinfo1 = impexp.mapp1.xom.config.nodeinfo

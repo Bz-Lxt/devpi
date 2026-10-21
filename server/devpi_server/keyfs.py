@@ -426,6 +426,25 @@ class KeyFS:
             with self.read_transaction(at_serial=serial):
                 self._import_subscriber(serial, subscriber_changes)
 
+    def import_changes_next(self, changes):
+        """ Import changes at the next local serial.
+
+        Unlike ``import_changes`` this is used to replay changelog entries
+        which originate from another instance, e.g. when importing
+        incremental exports on top of a logically imported full export.
+        The original ``back_serial`` values don't refer to the local
+        changelog, so they are reset to ``None`` which makes the storage
+        derive them from the local database, keeping the changelog chain
+        intact. Returns the serial the changes were committed at.
+        """
+        serial = self.get_next_serial()
+        local_changes = {
+            relpath: (keyname, None, val)
+            for relpath, (keyname, _back_serial, val) in changes.items()
+        }
+        self.import_changes(serial, local_changes)
+        return serial
+
     def subscribe_on_import(self, subscriber):
         assert self._import_subscriber is None
         self._import_subscriber = subscriber

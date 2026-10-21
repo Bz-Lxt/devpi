@@ -384,6 +384,18 @@ def add_export_options(
         "--include-mirrored-files", action="store_true",
         help="include downloaded files from mirror indexes in dump.")
 
+    parser.addoption(
+        "--incremental", action="store_true",
+        help="create an incremental export from the serial recorded in an "
+             "existing full export. The directory argument must point to "
+             "the existing export. The export can be interrupted and "
+             "re-run to continue from the last completely exported serial.")
+
+    parser.addoption(
+        "--last-serial", type=int, default=None, metavar="SERIAL",
+        help="with --incremental, only export up to the given serial. "
+             "Defaults to the current serial.")
+
 
 def add_import_options(
     parser: MyArgumentParser,
@@ -400,9 +412,15 @@ def add_import_options(
         help="no events will be run during import, instead they are "
              "postponed to run on server start. This allows much faster "
              "start of the server after import, when devpi-web is used. "
-             "When you start the server after the import, the search "
+             "When you start the server after import, the search "
              "index and documentation will gradually update until the "
              "server has caught up with all events.")
+
+    parser.addoption(
+        "--no-increments", action="store_false",
+        default=True, dest="apply_increments",
+        help="don't apply incremental export data contained in the "
+             "export directory, only import the full export.")
 
 
 def add_secretfile_option(
@@ -1000,6 +1018,18 @@ class Config:
     @property
     def include_mirrored_files(self):
         return getattr(self.args, 'include_mirrored_files', False)
+
+    @property
+    def incremental_export(self):
+        return getattr(self.args, 'incremental', False)
+
+    @property
+    def export_last_serial(self):
+        return getattr(self.args, 'last_serial', None)
+
+    @property
+    def apply_increments(self):
+        return getattr(self.args, 'apply_increments', True)
 
     @property
     def mirror_cache_expiry(self):

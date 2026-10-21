@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from .filestore import Digests
 from .filestore import get_hashes
+from .fileutil import loads
+from .keyfs_types import RelPath
 from .log import threadlog
 from .main import CommandRunner
 from .main import DATABASE_VERSION
@@ -45,6 +47,14 @@ if TYPE_CHECKING:
     from typing import Any
 
 
+# layout of the incremental data inside an export directory
+INCREMENTS_DIRNAME = "+increments"
+INCREMENTS_INDEX_FILENAME = "index.json"
+INCREMENTS_CHANGELOG_DIRNAME = "changelog"
+INCREMENTS_FILES_DIRNAME = "files"
+INCREMENTS_VERSION = 1
+
+
 def has_users_or_stages(xom: XOM) -> bool:
     userlist = xom.model.get_userlist()
     if len(userlist) == 0:
@@ -64,8 +74,19 @@ def has_users_or_stages(xom: XOM) -> bool:
     return True
 
 
-def do_export(path: Path | str, tw: TerminalWriter, xom: XOM) -> int:
+def do_export(
+    path: Path | str,
+    tw: TerminalWriter,
+    xom: XOM,
+    *,
+    incremental: bool = False,
+    last_serial: int | None = None,
+) -> int:
     path = Path(path)
+    if incremental:
+        inc_dumper = IncrementalExporter(tw, xom)
+        inc_dumper.dump(path, last_serial=last_serial)
+        return 0
     if path.exists() and path.is_dir() and any(path.iterdir()):
         msg = f"export directory {path} must not exist or be empty"
         raise Fatal(msg)
@@ -101,7 +122,13 @@ def export(pluginmanager=None, argv=None):
             msg = f"The path '{config.server_path}' contains no devpi-server data, use devpi-init to initialize."
             raise Fatal(msg)
         xom = xom_from_config(config)
-        do_export(config.args.directory, runner.tw, xom)
+        do_export(
+            config.args.directory,
+            runner.tw,
+            xom,
+            incremental=config.incremental_export,
+            last_serial=config.export_last_serial,
+        )
     return runner.return_code or 0
 
 
@@ -208,6 +235,9 @@ class Exporter:
         self.export["dumpversion"] = self.DUMPVERSION
         self.export["pythonversion"] = list(sys.version_info)
         self.export["devpi_server"] = server_version
+        # record the serial the full export represents, so incremental
+        # exports can append the changelog entries following it
+        self.export["serial"] = self.xom.keyfs.get_current_serial()
         for user in self.xom.model.get_userlist():
             userdir = path / user.name
             data = user.get(credentials=True)
@@ -352,6 +382,194 @@ class IndexDump:
         d["relpath"] = str(relpath)
         self.indexmeta["files"].append(d)
         self.exporter.completed(f"{type}: {relpath} ")
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    # write to a temp file and rename, so an interrupted export never
+    # leaves a truncated result at the final path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with tmp.open("wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+class IncrementalExporter:
+    """ Export changelog entries following a full export.
+
+    The data is written one serial at a time and a marker file records
+    the last completely exported serial, which allows the export to be
+    continued after it was interrupted. Files referenced by the changes
+    are copied alongside the changelog entries.
+    """
+
+    def __init__(self, tw: TerminalWriter, xom: XOM) -> None:
+        self.tw = tw
+        self.xom = xom
+        self.config = xom.config
+        self.filestore = xom.filestore
+        self.keyfs = xom.keyfs
+
+    @property
+    def file_keynames(self) -> frozenset[str]:
+        return frozenset((self.keyfs.STAGEFILE.name, self.keyfs.PYPIFILE_NOMD5.name))
+
+    def warn(self, msg: str) -> None:
+        self.tw.line(msg, yellow=True)
+
+    def read_json(self, path: Path) -> Any:
+        with path.open() as f:
+            return json.load(f)
+
+    def write_json(self, path: Path, data: Any) -> None:
+        _atomic_write_bytes(path, json.dumps(data, indent=2).encode("utf-8"))
+
+    def dump(self, path: Path, last_serial: int | None = None) -> None:
+        path = Path(path)
+        dataindex_path = path / "dataindex.json"
+        if not dataindex_path.is_file():
+            msg = (
+                f"incremental export directory {path} must contain the "
+                f"dataindex.json of a full export"
+            )
+            raise Fatal(msg)
+        export_data = self.read_json(dataindex_path)
+        base_serial = export_data.get("serial")
+        if not isinstance(base_serial, int) or base_serial < 0:
+            msg = (
+                "the full export doesn't record a base serial, create a "
+                "new full export with this version to allow incremental "
+                "exports"
+            )
+            raise Fatal(msg)
+
+        incdir = path / INCREMENTS_DIRNAME
+        changelog_dir = incdir / INCREMENTS_CHANGELOG_DIRNAME
+        files_dir = incdir / INCREMENTS_FILES_DIRNAME
+        state_path = incdir / INCREMENTS_INDEX_FILENAME
+        serials: list[int] = []
+        if state_path.is_file():
+            state = self.read_json(state_path)
+            if state.get("incrementversion") != INCREMENTS_VERSION:
+                msg = (
+                    f"unsupported incremental data version "
+                    f"{state.get('incrementversion')!r} in {state_path}"
+                )
+                raise Fatal(msg)
+            if state.get("base_serial") != base_serial:
+                msg = (
+                    f"base serial of existing incremental export "
+                    f"{state.get('base_serial')} doesn't match full export "
+                    f"{base_serial}"
+                )
+                raise Fatal(msg)
+            done_serial = int(state["last_serial"])
+            serials = list(state["serials"])
+        else:
+            done_serial = base_serial
+
+        current_serial = self.keyfs.get_current_serial()
+        if last_serial is None:
+            end_serial = current_serial
+        else:
+            if last_serial < base_serial:
+                msg = (
+                    f"last serial {last_serial} is before the base serial "
+                    f"{base_serial}"
+                )
+                raise Fatal(msg)
+            if last_serial > current_serial:
+                msg = (
+                    f"last serial {last_serial} is beyond the current serial "
+                    f"{current_serial}"
+                )
+                raise Fatal(msg)
+            end_serial = last_serial
+        if end_serial < done_serial:
+            msg = (
+                f"incremental export already includes serial {done_serial}, "
+                f"can't export up to the earlier serial {end_serial}"
+            )
+            raise Fatal(msg)
+        if end_serial == done_serial:
+            self.tw.line(
+                f"no new serials to export, already at serial {done_serial}"
+            )
+            return
+
+        self.tw.line(
+            f"incremental export of serials {done_serial + 1} to {end_serial}"
+        )
+        for serial in range(done_serial + 1, end_serial + 1):
+            self.dump_serial(serial, changelog_dir, files_dir)
+            serials.append(serial)
+            # the marker is updated after each serial, so an interrupted
+            # export continues with the next serial when re-run
+            self.write_json(
+                state_path,
+                {
+                    "incrementversion": INCREMENTS_VERSION,
+                    "base_serial": base_serial,
+                    "last_serial": serial,
+                    "serials": serials,
+                },
+            )
+            self.tw.line(f"exported serial {serial}/{end_serial}", bold=True)
+
+    def dump_serial(
+        self, serial: int, changelog_dir: Path, files_dir: Path
+    ) -> None:
+        with self.keyfs.read_transaction(at_serial=serial):
+            raw_entry = self.keyfs.tx.conn.get_raw_changelog_entry(serial)
+            if raw_entry is None:
+                msg = f"no changelog entry found for serial {serial}"
+                raise Fatal(msg)
+            changes = self.keyfs.tx.conn.get_changes(serial)
+            for relpath, (keyname, _back_serial, val) in changes.items():
+                if keyname not in self.file_keynames or val is None:
+                    continue
+                if (
+                    keyname == self.keyfs.PYPIFILE_NOMD5.name
+                    and not self.config.include_mirrored_files
+                ):
+                    # mirrored files are excluded by default, they are
+                    # fetched on demand and event handling tolerates
+                    # missing files on mirror indexes
+                    continue
+                self.dump_file(files_dir, relpath, keyname, val)
+        _atomic_write_bytes(changelog_dir / str(serial), bytes(raw_entry))
+
+    def dump_file(
+        self, files_dir: Path, relpath: str, keyname: str, val: dict
+    ) -> None:
+        dest = files_dir / relpath
+        if dest.exists():
+            # the content of a file relpath is immutable, so we can skip
+            # files which have been copied during an earlier run
+            return
+        key = self.keyfs.get_key_instance(keyname, RelPath(relpath))
+        entry = self.filestore.get_file_entry_from_key(key, meta=val)
+        if not entry.file_exists():
+            # the file was removed in a later serial (e.g. a delete or
+            # fsck), replay tolerates missing files just like replication
+            self.warn(f"skipping missing file at serial: {relpath}")
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(f".{dest.name}.tmp-{os.getpid()}")
+        src = entry.file_os_path()
+        if self.config.hard_links and src is not None:
+            self.tw.line("link incremental file at %s" % relpath)
+            if tmp.exists():
+                tmp.unlink()
+            os.link(src, tmp)
+        elif src is not None:
+            self.tw.line("copy incremental file at %s" % relpath)
+            shutil.copyfile(src, tmp)
+        else:
+            self.tw.line("write incremental file at %s" % relpath)
+            with entry.file_open_read() as sf, tmp.open("wb") as df:
+                shutil.copyfileobj(sf, df)
+        os.replace(tmp, dest)
 
 
 @define(kw_only=True)
@@ -644,7 +862,122 @@ class Importer:
                 msg = f"Some files weren't imported: {', '.join(sorted(skipped))}"
                 raise Fatal(msg)
 
+        self.import_increments(path)
         self.tw.line("********* import_all: importing finished ***********")
+
+    def import_increments(self, path: Path) -> None:
+        incdir = path / INCREMENTS_DIRNAME
+        state_path = incdir / INCREMENTS_INDEX_FILENAME
+        if not state_path.is_file():
+            return
+        if not self.xom.config.apply_increments:
+            self.warn(
+                f"found incremental export data at {incdir}, but it is "
+                f"skipped as requested"
+            )
+            return
+        state = self.read_json(state_path)
+        if state.get("incrementversion") != INCREMENTS_VERSION:
+            msg = (
+                f"unsupported incremental data version "
+                f"{state.get('incrementversion')!r} in {state_path}"
+            )
+            raise Fatal(msg)
+        base_serial = state["base_serial"]
+        full_serial = self.import_data.get("serial")
+        if not isinstance(full_serial, int) or full_serial != base_serial:
+            msg = (
+                f"the incremental data is based on serial {base_serial}, but "
+                f"the full export represents serial {full_serial!r}; import "
+                f"the matching full export first"
+            )
+            raise Fatal(msg)
+        changelog_dir = incdir / INCREMENTS_CHANGELOG_DIRNAME
+        files_dir = incdir / INCREMENTS_FILES_DIRNAME
+        serials = list(state["serials"])
+        self.tw.line(
+            f"******** Importing {len(serials)} incremental serial(s) "
+            f"from serial {base_serial} **********"
+        )
+        keyfs = self.xom.keyfs
+        for serial in serials:
+            entry_path = changelog_dir / str(serial)
+            if not entry_path.is_file():
+                msg = f"missing changelog entry for incremental serial {serial}: {entry_path}"
+                raise Fatal(msg)
+            (changes, _rel_renames) = loads(entry_path.read_bytes())
+            file_changes = [
+                (relpath, keyname, val)
+                for relpath, (keyname, _back_serial, val) in changes.items()
+                if keyname in self.file_keynames
+            ]
+            # the current metadata of deleted files is needed to locate
+            # hash based file storage, read it before the replay
+            deleted_meta = {}
+            with keyfs.read_transaction() as tx:
+                for relpath, keyname, val in file_changes:
+                    if val is None:
+                        key = keyfs.get_key_instance(keyname, RelPath(relpath))
+                        deleted_meta[relpath] = tx.get(key)
+            # files must be materialized before the changelog entry is
+            # committed, like the replica does, so subscribers never see
+            # missing files
+            with keyfs.filestore_transaction():
+                for relpath, keyname, val in file_changes:
+                    self.import_increment_file(
+                        files_dir, relpath, keyname, val,
+                        current_meta=deleted_meta.get(relpath))
+            keyfs.import_changes_next(changes)
+            self.tw.line(f"imported incremental serial {serial}", bold=True)
+
+    @property
+    def file_keynames(self) -> frozenset[str]:
+        keyfs = self.xom.keyfs
+        return frozenset((keyfs.STAGEFILE.name, keyfs.PYPIFILE_NOMD5.name))
+
+    def import_increment_file(
+        self,
+        files_dir: Path,
+        relpath: str,
+        keyname: str,
+        val: dict | None,
+        current_meta: dict | None = None,
+    ) -> None:
+        keyfs = self.xom.keyfs
+        key = keyfs.get_key_instance(keyname, RelPath(relpath))
+        if val is None:
+            # the file was deleted in this serial, use the metadata
+            # read before the replay to locate the file (hash based
+            # storage needs the digest from the current metadata)
+            entry = self.filestore.get_file_entry_from_key(
+                key, meta=current_meta)
+            if entry.file_exists():
+                self.tw.line("delete incremental file at %s" % relpath)
+                entry.file_delete()
+            return
+        entry = self.filestore.get_file_entry_from_key(key, meta=val)
+        if entry.file_exists():
+            # the file content is already in place
+            return
+        src = files_dir / relpath
+        if not src.is_file():
+            # the file was removed in a later serial (e.g. a delete or
+            # fsck), the event handling tolerates missing files like
+            # replication does
+            self.warn(f"skipping missing incremental file: {relpath}")
+            return
+        hashes = Digests(val.get("hashes", {}))
+        if hash_spec := val.get("hash_spec"):
+            hashes.add_spec(hash_spec)
+        self.tw.line("restore incremental file at %s" % relpath)
+        f = src.open("rb")
+        if self.xom.config.hard_links:
+            # additional attribute for hard links
+            f.devpi_srcpath = src  # type: ignore[attr-defined]
+        try:
+            entry.file_set_content_no_meta(f, hashes=hashes)
+        finally:
+            f.close()
 
     def wait_for_events(self) -> None:
         keyfs = self.xom.keyfs
